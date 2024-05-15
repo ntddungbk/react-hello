@@ -9,5 +9,11 @@ pipeline {
                 sh 'yarn build'
             }
         }
+
+        stage("Zip") {
+            steps {
+                sh 'zip -r build.zip build'
+            }
+        }
     }
 }
