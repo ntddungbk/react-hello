@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebRTC vs WebSocket Benchmark</title>
+    <script src="https://cdn.jsdelivr.net/npm/alawmulaw"></script>
+  </head>
+  <body>
+    <div class="panel">
+      <h2>WebSocket Connection</h2>
+      <div id="ws-chat" class="chat-container"></div>
+      <div id="ws-metrics" class="metrics">
+        <div class="metric">
+          RTT (Round Trip Time): <span id="ws-rtt">0</span>
+        </div>
+      </div>
+      <button id="ws-button">Connect WebSocket</button>
+    </div>
+    <script>
+      let webSocket;
+      let wsMetrics = {
+        pingStartTime: 0,
+        rttValues: [],
+      };
+      const sampleRate = 24000;
+      let chatHistoryWebSocket = [];
+
+      function addMessage(role, content) {
+        const container = document.getElementById("ws-chat");
+        const messageDiv = document.createElement("div");
+        messageDiv.classList.add("message", role);
+        messageDiv.textContent = content;
+        container.appendChild(messageDiv);
+        container.scrollTop = container.scrollHeight;
+        chatHistoryWebSocket.push({ role, content });
+      }
+      function convertToMulaw(audioData, sampleRate) {
+        // Convert float32 [-1,1] to int16 [-32768,32767]
+        const int16Data = new Int16Array(audioData.length);
+        for (let i = 0; i < audioData.length; i++) {
+          int16Data[i] = Math.floor(audioData[i] * 32768);
+        }
+
+        // Convert to mu-law using the library
+        return alawmulaw.mulaw.encode(int16Data);
+      }
+      function generateId() {
+        return Math.random().toString(36).substring(7);
+      }
+
+      async function setupWebSocket() {
+        const button = document.getElementById("ws-button");
+        button.textContent = "Stop";
+
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: { exact: true },
+              sampleRate: { ideal: sampleRate },
+            },
+          });
+          const wsId = generateId();
+          wsMetrics.startTime = performance.now();
+
+          // Create audio context and analyser for visualization
+          const audioContext = new AudioContext({ sampleRate: sampleRate });
+          const analyser = audioContext.createAnalyser();
+          const source = audioContext.createMediaStreamSource(stream);
+          source.connect(analyser);
+
+          // Connect to websocket endpoint
+          webSocket = new WebSocket(
+            `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${
+              window.location.host
+            }/websocket/offer`
+          );
+
+          webSocket.onopen = () => {
+            // Send initial start message
+            webSocket.send(
+              JSON.stringify({
+                event: "start",
+                websocket_id: wsId,
+              })
+            );
+
+            // Setup audio processing
+            const processor = audioContext.createScriptProcessor(2048, 1, 1);
+            source.connect(processor);
+            processor.connect(audioContext.destination);
+
+            processor.onaudioprocess = (e) => {
+              const inputData = e.inputBuffer.getChannelData(0);
+              const mulawData = convertToMulaw(
+                inputData,
+                audioContext.sampleRate
+              );
+              const base64Audio = btoa(
+                String.fromCharCode.apply(null, mulawData)
+              );
+              if (webSocket.readyState === WebSocket.OPEN) {
+                webSocket.send(
+                  JSON.stringify({
+                    event: "media",
+                    media: {
+                      payload: base64Audio,
+                    },
+                  })
+                );
+              }
+            };
+
+            // Add ping interval
+            webSocket.pingInterval = setInterval(() => {
+              wsMetrics.pingStartTime = performance.now();
+              webSocket.send(
+                JSON.stringify({
+                  event: "ping",
+                })
+              );
+            }, 500);
+          };
+
+          // Setup audio output context
+          const outputContext = new AudioContext({ sampleRate: sampleRate });
+          let audioQueue = [];
+          let isPlaying = false;
+
+          webSocket.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            if (data?.type === "send_input") {
+              console.log("sending input");
+              fetch("/input_hook", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  webrtc_id: wsId,
+                  chatbot: chatHistoryWebSocket,
+                }),
+              });
+            }
+            if (data.event === "media") {
+              // Process received audio
+              const audioData = atob(data.media.payload);
+              const mulawData = new Uint8Array(audioData.length);
+              for (let i = 0; i < audioData.length; i++) {
+                mulawData[i] = audioData.charCodeAt(i);
+              }
+
+              // Convert mu-law to linear PCM
+              const linearData = alawmulaw.mulaw.decode(mulawData);
+
+              // Create an AudioBuffer
+              const audioBuffer = outputContext.createBuffer(
+                1,
+                linearData.length,
+                sampleRate
+              );
+              const channelData = audioBuffer.getChannelData(0);
+
+              // Fill the buffer with the decoded data
+              for (let i = 0; i < linearData.length; i++) {
+                channelData[i] = linearData[i] / 32768.0;
+              }
+
+              // Queue the audio buffer
+              audioQueue.push(audioBuffer);
+
+              // Start playing if not already playing
+              if (!isPlaying) {
+                playNextBuffer();
+              }
+            }
+
+            // Add pong handler
+            if (data.event === "pong") {
+              const rtt = performance.now() - wsMetrics.pingStartTime;
+              wsMetrics.rttValues.push(rtt);
+              // Keep only last 20 values for running mean
+              if (wsMetrics.rttValues.length > 20) {
+                wsMetrics.rttValues.shift();
+              }
+              const avgRtt =
+                wsMetrics.rttValues.reduce((a, b) => a + b, 0) /
+                wsMetrics.rttValues.length;
+              document.getElementById("ws-rtt").textContent = `${avgRtt.toFixed(
+                2
+              )}ms`;
+              return;
+            }
+          };
+
+          function playNextBuffer() {
+            if (audioQueue.length === 0) {
+              isPlaying = false;
+              return;
+            }
+
+            isPlaying = true;
+            const bufferSource = outputContext.createBufferSource();
+            bufferSource.buffer = audioQueue.shift();
+            bufferSource.connect(outputContext.destination);
+
+            bufferSource.onended = playNextBuffer;
+            bufferSource.start();
+          }
+
+          const eventSource = new EventSource("/outputs?webrtc_id=" + wsId);
+          eventSource.addEventListener("output", (event) => {
+            console.log("ws output", event);
+            const eventJson = JSON.parse(event.data);
+            addMessage("ws-chat", eventJson.role, eventJson.content);
+          });
+        } catch (err) {
+          console.error("WebSocket setup error:", err);
+          button.disabled = false;
+        }
+      }
+
+      function ws_stop() {
+        if (webSocket) {
+          webSocket.send(
+            JSON.stringify({
+              event: "stop",
+            })
+          );
+          // Clear ping interval
+          if (webSocket.pingInterval) {
+            clearInterval(webSocket.pingInterval);
+          }
+          // Reset RTT display
+          document.getElementById("ws-rtt").textContent = "-";
+          wsMetrics.rttValues = [];
+
+          // Clear the stats interval
+          if (webSocket.statsInterval) {
+            clearInterval(webSocket.statsInterval);
+          }
+          webSocket.close();
+        }
+      }
+
+      const ws_start_button = document.getElementById("ws-button");
+      ws_start_button.addEventListener("click", () => {
+        if (ws_start_button.textContent === "Connect WebSocket") {
+          setupWebSocket();
+          ws_start_button.textContent = "Stop";
+        } else {
+          ws_stop();
+          ws_start_button.textContent = "Connect WebSocket";
+        }
+      });
+      document.addEventListener("beforeunload", () => {
+        ws_stop();
+      });
+    </script>
+  </body>
+</html>
